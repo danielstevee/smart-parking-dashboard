@@ -2,7 +2,9 @@
 #include <Wire.h>
 #include <SPI.h>
 #include <WiFi.h>
+#include <ESPmDNS.h>
 #include <PubSubClient.h>
+#include <WebSocketsServer.h>
 #include <functional>
 #include <LiquidCrystal_I2C.h>
 #include <MFRC522.h>
@@ -37,7 +39,7 @@ namespace Config {
   constexpr bool     LED_ON_WHEN_FREE = true;
 
   // Palang
-  constexpr uint32_t CARD_WAIT_MS     = 10000;
+  constexpr uint32_t CARD_WAIT_MS     = 5000;
   constexpr uint32_t GATE_MIN_OPEN_MS = 4000;
   constexpr uint32_t GATE_MAX_OPEN_MS = 15000;
   constexpr uint32_t MSG_MS           = 2000;
@@ -50,11 +52,16 @@ namespace Config {
   constexpr const char* WIFI_SSID     = "ss";
   // constexpr const char* WIFI_PASS     = "pandu456";
   constexpr const char* WIFI_PASS     = "11110000";
-  constexpr uint32_t    WIFI_RETRY_MS = 10000;
+  constexpr uint32_t    WIFI_RETRY_MS           = 10000;
+  constexpr uint32_t    WIFI_CONNECT_TIMEOUT_MS = 15000;
+  // TX power lebih rendah => arus puncak lebih kecil (mitigasi brownout).
+  // Hapus/naikkan jika sinyal ke hotspot terlalu lemah.
+  constexpr wifi_power_t WIFI_TX_POWER = WIFI_POWER_11dBm;
 
   // ---------- MQTT ----------
+  constexpr bool        MQTT_ENABLED   = true;   // false => MQTT dilewati total
   // PENTING: bukan "localhost". Isi dengan IP LAN PC yang menjalankan Mosquitto
-  // (cek dengan `ipconfig` / `ip a`).
+  // di jaringan WiFi yang SAMA dengan ESP32 (cek dengan `ipconfig` / `ip a`).
   constexpr const char* MQTT_HOST      = "192.168.1.10";
   constexpr uint16_t    MQTT_PORT      = 1883;               // TCP, bukan 9001 (itu WebSocket)
   constexpr const char* MQTT_CLIENT_ID = "esp32-smart-parking";
@@ -64,6 +71,11 @@ namespace Config {
   constexpr const char* TOPIC_SLOT_STATUS = "parking/slot/status";   // dibaca dashboard
   constexpr const char* TOPIC_GATE_EVENT  = "parking/gate/event";
   constexpr const char* TOPIC_SYS_STATUS  = "parking/system/status"; // LWT
+
+  // ---------- WebSocket ----------
+  constexpr uint16_t    WS_PORT          = 81;
+  constexpr const char* MDNS_HOST        = "smart-parking";  // ws://smart-parking.local:81
+  constexpr uint32_t    STATUS_PERIOD_MS = 1000;             // push berkala selama ada client
 
   // UID yang diizinkan
   const char* const UIDS[] = {
@@ -306,9 +318,7 @@ public:
     Serial.println("[RFID D] PCD_Init berhasil");
     delay(50);
     byte v = rfid_.PCD_ReadRegister(MFRC522::VersionReg);
-    Serial.printf(
-        "[RFID F] VersionReg: 0x%02X\n", v
-    );
+    Serial.printf("[RFID F] VersionReg: 0x%02X\n", v);
   }
 
   bool read(String& uid) { return readCard(uid) || readSerial(uid); }
@@ -351,26 +361,46 @@ private:
 // =====================================================
 class WifiManager {
 public:
-  // Gaya sederhana: blocking sampai tersambung (dipanggil sekali di setup)
+  // Gaya sederhana: blocking (dipanggil sekali di setup, sebelum servo di-attach).
+  // Dibatasi timeout agar tidak hang selamanya jika SSID tidak ada.
   void connectWiFi() {
     Serial.print("Menyambung WiFi");
     WiFi.mode(WIFI_STA);
     WiFi.begin(Config::WIFI_SSID, Config::WIFI_PASS);
-    while (WiFi.status() != WL_CONNECTED) {
+    WiFi.setTxPower(Config::WIFI_TX_POWER);
+
+    const uint32_t t0 = millis();
+    while (!connected() && millis() - t0 < Config::WIFI_CONNECT_TIMEOUT_MS) {
       delay(300);
       Serial.print(".");
     }
-    Serial.println(" tersambung!");
-    Serial.printf("[WIFI] IP: %s RSSI: %d dBm\n",
-                  WiFi.localIP().toString().c_str(), WiFi.RSSI());
-    wasUp_ = true;
+
+    lastTry_ = millis();
+    if (connected()) {
+      wasUp_ = true;
+      justConnected_ = true;
+      Serial.println(" tersambung!");
+      Serial.printf("[WIFI] IP: %s RSSI: %d dBm\n",
+                    WiFi.localIP().toString().c_str(), WiFi.RSSI());
+    } else {
+      Serial.println(" gagal. Lanjut tanpa WiFi, retry di background.");
+    }
   }
 
-  // Di loop(): hanya menyambung ulang jika terputus (tidak memblokir)
+  // Di loop(): deteksi sambung/putus + reconnect non-blocking
   void update() {
-    if (connected()) { wasUp_ = true; return; }
-    if (wasUp_) { wasUp_ = false; Serial.println("[WIFI] Terputus."); }
-    if (millis() - lastTry_ >= Config::WIFI_RETRY_MS) {
+    const bool up = connected();
+    if (up && !wasUp_) {
+      wasUp_ = true;
+      justConnected_ = true;
+      Serial.printf("[WIFI] Tersambung. IP: %s RSSI: %d dBm\n",
+                    WiFi.localIP().toString().c_str(), WiFi.RSSI());
+    } else if (!up && wasUp_) {
+      wasUp_ = false;
+      Serial.println("[WIFI] Terputus.");
+    }
+
+    if (!up && millis() - lastTry_ >= Config::WIFI_RETRY_MS) {
       lastTry_ = millis();
       Serial.println("[WIFI] Menyambung ulang...");
       WiFi.reconnect();
@@ -379,9 +409,17 @@ public:
 
   bool connected() const { return WiFi.status() == WL_CONNECTED; }
 
+  // True sekali setiap kali WiFi baru tersambung (untuk menampilkan IP di LCD)
+  bool takeJustConnected() {
+    bool r = justConnected_;
+    justConnected_ = false;
+    return r;
+  }
+
 private:
-  uint32_t lastTry_ = 0;
-  bool     wasUp_   = false;
+  uint32_t lastTry_       = 0;
+  bool     wasUp_         = false;
+  bool     justConnected_ = false;
 };
 
 // =====================================================
@@ -440,64 +478,180 @@ private:
 };
 
 // =====================================================
-// Telemetry: publish status slot + event palang
+// WsLink: WebSocket server (links2004/WebSockets) + mDNS
+// Di-poll dari loop() => semua callback jalan di task yang sama
+// dengan sensor/palang, jadi tidak perlu mutex.
+// =====================================================
+class WsLink {
+public:
+  using ClientHandler = std::function<void(uint8_t)>;
+  using TextHandler   = std::function<void(uint8_t, const char*)>;
+
+  explicit WsLink(WifiManager& wifi) : wifi_(wifi), server_(Config::WS_PORT) {}
+
+  void onClientConnected(ClientHandler h) { onConnect_ = h; }
+  void onText(TextHandler h)              { onText_ = h; }
+
+  void update() {
+    const bool up = wifi_.connected();
+    if (up && !wasUp_) onWifiUp();
+    wasUp_ = up;
+
+    if (up && started_) server_.loop();
+  }
+
+  bool hasClients() { return started_ && server_.connectedClients() > 0; }
+
+  bool broadcast(const char* payload)            { return started_ && server_.broadcastTXT(payload); }
+  bool sendTo(uint8_t num, const char* payload)  { return started_ && server_.sendTXT(num, payload); }
+
+private:
+  // Dipanggil setiap WiFi (re)connect
+  void onWifiUp() {
+    if (!started_) {
+      server_.begin();
+      server_.onEvent([this](uint8_t num, WStype_t type, uint8_t* payload, size_t len) {
+        handleEvent(num, type, payload, len);
+      });
+      // Ping berkala: client yang mati dibersihkan agar slot client (maks 5) tidak habis.
+      server_.enableHeartbeat(15000, 3000, 2);
+      started_ = true;
+    }
+
+    MDNS.end();   // aman dipanggil walau belum aktif; restart setelah reconnect
+    if (MDNS.begin(Config::MDNS_HOST)) {
+      MDNS.addService("ws", "tcp", Config::WS_PORT);
+      Serial.printf("[WS] mDNS: ws://%s.local:%u\n", Config::MDNS_HOST, Config::WS_PORT);
+    } else {
+      Serial.println("[WS] mDNS gagal, pakai IP langsung.");
+    }
+    Serial.printf("[WS] Listening: ws://%s:%u\n",
+                  WiFi.localIP().toString().c_str(), Config::WS_PORT);
+  }
+
+  void handleEvent(uint8_t num, WStype_t type, uint8_t* payload, size_t len) {
+    switch (type) {
+      case WStype_CONNECTED:
+        Serial.printf("[WS] #%u tersambung dari %s\n", num,
+                      server_.remoteIP(num).toString().c_str());
+        if (onConnect_) onConnect_(num);   // kirim snapshot status ke client baru
+        break;
+
+      case WStype_DISCONNECTED:
+        Serial.printf("[WS] #%u terputus\n", num);
+        break;
+
+      case WStype_TEXT:
+        // payload dijamin NUL-terminated oleh library
+        if (onText_) onText_(num, reinterpret_cast<const char*>(payload));
+        break;
+
+      default:
+        break;
+    }
+  }
+
+  WifiManager&     wifi_;
+  WebSocketsServer server_;
+  ClientHandler    onConnect_;
+  TextHandler      onText_;
+  bool             started_ = false;
+  bool             wasUp_   = false;
+};
+
+// =====================================================
+// Telemetry: status slot + event palang ke MQTT dan WebSocket.
+// Payload dibangun sekali, dikirim ke tiap channel dengan timer sendiri.
 // =====================================================
 class Telemetry {
 public:
-  Telemetry(MqttLink& mqtt, const ParkingLot& lot) : mqtt_(mqtt), lot_(lot) {}
+  Telemetry(MqttLink& mqtt, WsLink& ws, const ParkingLot& lot)
+    : mqtt_(mqtt), ws_(ws), lot_(lot) {}
 
-  // Publish saat slot berubah, atau heartbeat berkala, atau saat baru tersambung
   void update() {
-    if (!mqtt_.connected()) { force_ = true; return; }
-
     const uint32_t now  = millis();
     const uint8_t  mask = lot_.occupiedMask();
 
-    if (force_ || mask != lastMask_ || now - lastPub_ >= Config::HEARTBEAT_MS) {
-      if (publishStatus()) {
-        lastMask_ = mask;
-        lastPub_  = now;
-        force_    = false;
+    char buf[kStatusBuf];
+    bool built = false;
+
+    // ---- MQTT: perubahan / heartbeat / baru tersambung (retained) ----
+    if (!mqtt_.connected()) {
+      mqttCh_.force = true;                       // publish ulang saat tersambung lagi
+    } else if (due(mqttCh_, mask, now, Config::HEARTBEAT_MS)) {
+      buildStatus(buf, sizeof(buf)); built = true;
+      if (mqtt_.publish(Config::TOPIC_SLOT_STATUS, buf, true)) {
+        mark(mqttCh_, mask, now);
+        Serial.printf("[MQTT] -> %s %s\n", Config::TOPIC_SLOT_STATUS, buf);
       }
     }
+
+    // ---- WebSocket: perubahan / berkala selama ada client ----
+    if (ws_.hasClients() && due(wsCh_, mask, now, Config::STATUS_PERIOD_MS)) {
+      if (!built) buildStatus(buf, sizeof(buf));
+      if (ws_.broadcast(buf)) mark(wsCh_, mask, now);
+    }
+  }
+
+  // Snapshot untuk satu client WebSocket (saat connect / diminta)
+  void sendStatusTo(uint8_t num) {
+    char buf[kStatusBuf];
+    buildStatus(buf, sizeof(buf));
+    ws_.sendTo(num, buf);
   }
 
   void publishEvent(const char* event, const String& uid) {
-    char buf[160];
+    char buf[192];
     snprintf(buf, sizeof(buf),
-             "{\"event\":\"%s\",\"uid\":\"%s\",\"free\":%u,\"uptime\":%lu}",
+             "{\"type\":\"event\",\"event\":\"%s\",\"uid\":\"%s\",\"free\":%u,\"uptime\":%lu}",
              event, uid.c_str(), lot_.freeCount(), millis() / 1000UL);
     mqtt_.publish(Config::TOPIC_GATE_EVENT, buf, false);
+    if (ws_.hasClients()) ws_.broadcast(buf);
   }
 
 private:
-  bool publishStatus() {
-    char buf[384];
-    const uint8_t total  = lot_.size();
-    const uint8_t free_  = lot_.freeCount();
+  // ~110 B header + ~56 B per slot; skala otomatis dengan NUM_SLOTS
+  static constexpr size_t kStatusBuf = 128 + 56 * Config::NUM_SLOTS;
 
-    size_t n = snprintf(buf, sizeof(buf),
-                        "{\"total\":%u,\"filled\":%u,\"empty\":%u,\"uptime\":%lu,\"rssi\":%d,\"slots\":[",
-                        total, (uint8_t)(total - free_), free_, millis() / 1000UL, WiFi.RSSI());
+  struct Channel {
+    uint8_t  lastMask = 0xFF;   // nilai tidak valid agar publish pertama selalu terjadi
+    uint32_t lastPub  = 0;
+    bool     force    = true;
+  };
 
-    for (uint8_t i = 0; i < total && n < sizeof(buf); i++) {
+  static bool due(const Channel& c, uint8_t mask, uint32_t now, uint32_t periodMs) {
+    return c.force || mask != c.lastMask || now - c.lastPub >= periodMs;
+  }
+  static void mark(Channel& c, uint8_t mask, uint32_t now) {
+    c.lastMask = mask;
+    c.lastPub  = now;
+    c.force    = false;
+  }
+
+  void buildStatus(char* buf, size_t size) const {
+    const uint8_t total = lot_.size();
+    const uint8_t free_ = lot_.freeCount();
+
+    size_t n = snprintf(buf, size,
+                        "{\"type\":\"status\",\"total\":%u,\"filled\":%u,\"empty\":%u,"
+                        "\"uptime\":%lu,\"rssi\":%d,\"slots\":[",
+                        total, (uint8_t)(total - free_), free_,
+                        millis() / 1000UL, WiFi.RSSI());
+
+    for (uint8_t i = 0; i < total && n < size; i++) {
       const ParkingSlot& s = lot_.slot(i);
-      n += snprintf(buf + n, sizeof(buf) - n,
+      n += snprintf(buf + n, size - n,
                     "%s{\"id\":%u,\"occupied\":%s,\"distance\":%.1f}",
                     i ? "," : "", i + 1, s.occupied() ? "true" : "false", s.distance());
     }
-    if (n < sizeof(buf)) snprintf(buf + n, sizeof(buf) - n, "]}");
-
-    bool ok = mqtt_.publish(Config::TOPIC_SLOT_STATUS, buf, true);   // retained
-    if (ok) Serial.printf("[MQTT] -> %s %s\n", Config::TOPIC_SLOT_STATUS, buf);
-    return ok;
+    if (n < size) snprintf(buf + n, size - n, "]}");
   }
 
   MqttLink&         mqtt_;
+  WsLink&           ws_;
   const ParkingLot& lot_;
-  uint8_t  lastMask_ = 0xFF;   // nilai tidak valid agar publish pertama selalu terjadi
-  uint32_t lastPub_  = 0;
-  bool     force_    = true;
+  Channel           mqttCh_;
+  Channel           wsCh_;
 };
 
 // =====================================================
@@ -612,7 +766,7 @@ private:
 };
 
 // =====================================================
-// OBJEK GLOBAL (urutan definisi penting: lot sebelum telemetry)
+// OBJEK GLOBAL (urutan definisi penting: lot -> wifi -> wsLink/mqtt -> telemetry)
 // =====================================================
 ParkingLot   lot;
 MotionSensor pir(Config::PIR);
@@ -621,8 +775,9 @@ CardReader   reader;
 Gate         gate(pir, reader, lot, display);
 
 WifiManager  wifi;
+WsLink       wsLink(wifi);
 MqttLink     mqtt(wifi);
-Telemetry    telemetry(mqtt, lot);
+Telemetry    telemetry(mqtt, wsLink, lot);
 
 // =====================================================
 // SETUP / LOOP
@@ -644,13 +799,22 @@ void setup() {
   Serial.println("[STEP 5] WiFi");
   display.showMessage("Menyambung WiFi", "Mohon tunggu", 60000);
   display.render(lot);
-  wifi.connectWiFi();                // blocking, sebelum servo di-attach
-  mqtt.begin();
+  wifi.connectWiFi();                // blocking (timeout 15 s), sebelum servo di-attach
+  if (Config::MQTT_ENABLED) mqtt.begin();
 
   Serial.println("[STEP 6] gate.begin()");
   gate.begin();
   gate.setEventHandler([](const char* event, const String& uid) {
     telemetry.publishEvent(event, uid);
+  });
+
+  // WebSocket: client baru langsung dapat snapshot status
+  wsLink.onClientConnected([](uint8_t num) { telemetry.sendStatusTo(num); });
+
+  // WebSocket: perintah teks dari client "status" | "ping"
+  wsLink.onText([](uint8_t num, const char* msg) {
+    if (!strcmp(msg, "status"))     telemetry.sendStatusTo(num);
+    else if (!strcmp(msg, "ping"))  wsLink.sendTo(num, "{\"type\":\"pong\"}");
   });
 
   display.clearMessage();
@@ -660,9 +824,14 @@ void setup() {
 
 void loop() {
   wifi.update();
-  mqtt.update();
+  wsLink.update();
+  if (Config::MQTT_ENABLED) mqtt.update();
   lot.update();
   gate.update();
   telemetry.update();
+
+  if (wifi.takeJustConnected())      // tampilkan IP di LCD sebentar
+    display.showMessage("WiFi tersambung", WiFi.localIP().toString(), 4000);
+
   display.render(lot);
 }
