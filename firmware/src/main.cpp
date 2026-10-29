@@ -1,4 +1,3 @@
-#include <Arduino.h>
 #include <Wire.h>
 #include <SPI.h>
 #include <WiFi.h>
@@ -47,23 +46,23 @@ namespace Config {
 
   // ---------- WiFi ----------
   // constexpr const char* WIFI_SSID     = "Infinix Hot 40 Pro";
-  constexpr const char* WIFI_SSID     = "hiscan";
+  constexpr const char* WIFI_SSID     = "ss";
   // constexpr const char* WIFI_PASS     = "pandu456";
-  constexpr const char* WIFI_PASS     = "12345678";
+  constexpr const char* WIFI_PASS     = "11110000";
   constexpr uint32_t    WIFI_RETRY_MS = 10000;
 
   // ---------- MQTT ----------
   // PENTING: bukan "localhost". Isi dengan IP LAN PC yang menjalankan Mosquitto
   // (cek dengan `ipconfig` / `ip a`).
-  constexpr const char* MQTT_HOST      = "10.205.128.117";
+  constexpr const char* MQTT_HOST      = "broker.hivemq.com";
   constexpr uint16_t    MQTT_PORT      = 1883;               // TCP, bukan 9001 (itu WebSocket)
   constexpr const char* MQTT_CLIENT_ID = "esp32-smart-parking";
   constexpr uint32_t    MQTT_RETRY_MS  = 5000;
   constexpr uint32_t    HEARTBEAT_MS   = 10000;
 
-  constexpr const char* TOPIC_SLOT_STATUS = "parking/slot/status";   // dibaca dashboard
-  constexpr const char* TOPIC_GATE_EVENT  = "parking/gate/event";
-  constexpr const char* TOPIC_SYS_STATUS  = "parking/system/status"; // LWT
+  constexpr const char* TOPIC_SLOT_STATUS = "sparks/parking/slot/status";   // dibaca dashboard
+  constexpr const char* TOPIC_GATE_EVENT  = "sparks/parking/gate/event";
+  constexpr const char* TOPIC_SYS_STATUS  = "sparks/parking/system/status"; // LWT
 
   // UID yang diizinkan
   const char* const UIDS[] = {
