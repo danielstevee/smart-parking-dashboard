@@ -31,22 +31,22 @@ namespace Config {
   constexpr float    OCC_EXIT_CM      = 14.0f;  // > 14 cm  => kosong (hysteresis)
   constexpr uint8_t  CONFIRM_SAMPLES  = 3;
   constexpr uint32_t SENSOR_PERIOD_MS = 70;
-  constexpr uint32_t ECHO_TIMEOUT_US  = 25000;
+  constexpr uint32_t ECHO_TIMEOUT_US  = 10000;
   constexpr float    FAR_CM           = 400.0f;
   constexpr bool     LED_ON_WHEN_FREE = true;
 
   // Palang
-  constexpr uint32_t CARD_WAIT_MS     = 10000;
+  constexpr uint32_t CARD_WAIT_MS     = 2000;
   constexpr uint32_t GATE_MIN_OPEN_MS = 4000;
-  constexpr uint32_t GATE_MAX_OPEN_MS = 15000;
-  constexpr uint32_t MSG_MS           = 2000;
-  constexpr uint32_t COOLDOWN_MS      = 2500;
+  constexpr uint32_t GATE_MAX_OPEN_MS = 6000;
+  constexpr uint32_t MSG_MS           = 500;
+  constexpr uint32_t COOLDOWN_MS      = 2000;
   constexpr int      SERVO_CLOSED_DEG = 0;
   constexpr int      SERVO_OPEN_DEG   = 90;
 
   // ---------- WiFi ----------
   // constexpr const char* WIFI_SSID     = "Infinix Hot 40 Pro";
-  constexpr const char* WIFI_SSID     = "ss";
+  constexpr const char* WIFI_SSID     = "server";
   // constexpr const char* WIFI_PASS     = "pandu456";
   constexpr const char* WIFI_PASS     = "11110000";
   constexpr uint32_t    WIFI_RETRY_MS = 10000;
